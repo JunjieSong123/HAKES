@@ -134,6 +134,25 @@ class HakesFilterIndex : public HakesCollection {
                               const faiss::IDSelector* id_selector,
                               std::vector<std::pair<float, idx_t>>& results) const;
 
+  void GetNeighborsByHeuristic2(
+      std::priority_queue<std::pair<float, tableint>,
+                          std::vector<std::pair<float, tableint>>,
+                          FavorCompareByFirst<float>>& top_candidates,
+      size_t M);
+
+  tableint MutuallyConnectNewElement(
+      const float* data_point, tableint cur_c,
+      std::priority_queue<std::pair<float, tableint>,
+                          std::vector<std::pair<float, tableint>>,
+                          FavorCompareByFirst<float>>& top_candidates,
+      int level);
+
+  void SearchBaseLayerFilter(
+      tableint ep_id, const float* data_point, int level,
+      std::priority_queue<std::pair<float, tableint>,
+                          std::vector<std::pair<float, tableint>>,
+                          FavorCompareByFirst<float>>& result);
+
   std::unique_ptr<faiss::IndexFlatL> refine_index_;
   std::unique_ptr<TagChecker<idx_t>> del_checker_;
   
