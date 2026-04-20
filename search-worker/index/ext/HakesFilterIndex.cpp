@@ -16,6 +16,15 @@
 
 namespace faiss {
 
+inline float L2Sqr(const float* a, const float* b, int d) {
+  float sum = 0.0f;
+  for (int i = 0; i < d; i++) {
+    float diff = a[i] - b[i];
+    sum += diff * diff;
+  }
+  return sum;
+}
+
 HakesFilterIndex::HakesFilterIndex() {
   del_checker_.reset(new TagChecker<idx_t>());
 }
@@ -348,18 +357,13 @@ bool HakesFilterIndex::BuildFilterIndex(int n, int d, const float* vecs,
       std::memset(link_lists_[cur_c], 0, size_links_per_element_ * curlevel);
     }
     
-    if (cur_c > 0) {
+    float local_delta_d = 0.0f;
+    
+    if (static_cast<signed>(cur_c) > 0) {
       tableint currObj = enterpoint_node_;
       
       if (curlevel < maxlevel_) {
-        float curdist = 0.0f;
-        const float* currObj_data = GetDataByInternalId(currObj);
-        float dist_sum = 0.0f;
-        for (int dim = 0; dim < d; dim++) {
-          float diff = vec[dim] - currObj_data[dim];
-          dist_sum += diff * diff;
-        }
-        curdist = std::sqrt(dist_sum);
+        float curdist = L2Sqr(vec, GetDataByInternalId(currObj), d_);
         
         for (int lvl = maxlevel_; lvl > curlevel; lvl--) {
           bool changed = true;
@@ -372,14 +376,7 @@ bool HakesFilterIndex::BuildFilterIndex(int n, int d, const float* vecs,
             
             for (int j = 0; j < size; j++) {
               tableint cand = datal[j];
-              const float* cand_data = GetDataByInternalId(cand);
-              float d_cand = 0.0f;
-              for (int dim = 0; dim < d; dim++) {
-                float diff = vec[dim] - cand_data[dim];
-                d_cand += diff * diff;
-              }
-              d_cand = std::sqrt(d_cand);
-              
+              float d_cand = L2Sqr(vec, GetDataByInternalId(cand), d_);
               if (d_cand < curdist) {
                 curdist = d_cand;
                 currObj = cand;
@@ -391,47 +388,34 @@ bool HakesFilterIndex::BuildFilterIndex(int n, int d, const float* vecs,
       }
       
       for (int lvl = std::min(curlevel, maxlevel_); lvl >= 0; lvl--) {
-        std::vector<std::pair<float, tableint>> candidates;
+        std::priority_queue<std::pair<float, tableint>,
+                            std::vector<std::pair<float, tableint>>,
+                            FavorCompareByFirst<float>> top_candidates;
+        SearchBaseLayerFilter(currObj, vec, lvl, top_candidates);
         
-        for (tableint j = 0; j < cur_c; j++) {
-          if (element_levels_[j] >= lvl) {
-            const float* other_data = GetDataByInternalId(j);
-            float dist = 0.0f;
-            for (int dim = 0; dim < d; dim++) {
-              float diff = vec[dim] - other_data[dim];
-              dist += diff * diff;
-            }
-            dist = std::sqrt(dist);
-            candidates.emplace_back(dist, j);
+        if (lvl == 0 && top_candidates.size() == ef_construction_) {
+          float rate = static_cast<float>(ef_construction_ - 10);
+          auto temp = top_candidates;
+          std::vector<std::pair<float, tableint>> elements;
+          while (!temp.empty()) {
+            elements.push_back(temp.top());
+            temp.pop();
           }
+          
+          float diff = elements[0].first - elements[elements.size() - 10].first;
+          local_delta_d += 5.0f * diff / (rate * static_cast<float>(max_elements_));
         }
         
-        size_t num_neighbors = std::min(candidates.size(), M_);
-        std::partial_sort(candidates.begin(), 
-                         candidates.begin() + num_neighbors,
-                         candidates.end());
-        
-        if (lvl == 0) {
-          unsigned int* ll_cur = reinterpret_cast<unsigned int*>(
-              &data_level0_memory_[cur_c * size_data_per_element_]);
-          *reinterpret_cast<linklistsizeint*>(ll_cur) = static_cast<linklistsizeint>(num_neighbors);
-          tableint* data = reinterpret_cast<tableint*>(ll_cur + 1);
-          for (size_t idx = 0; idx < num_neighbors; idx++) {
-            data[idx] = candidates[idx].second;
-          }
-        } else {
-          unsigned int* ll_cur = reinterpret_cast<unsigned int*>(
-              link_lists_[cur_c] + (lvl - 1) * size_links_per_element_);
-          *reinterpret_cast<linklistsizeint*>(ll_cur) = static_cast<linklistsizeint>(num_neighbors);
-          tableint* data = reinterpret_cast<tableint*>(ll_cur + 1);
-          for (size_t idx = 0; idx < num_neighbors; idx++) {
-            data[idx] = candidates[idx].second;
-          }
-        }
+        currObj = MutuallyConnectNewElement(vec, cur_c, top_candidates, lvl);
       }
     } else {
       enterpoint_node_ = 0;
       maxlevel_ = curlevel;
+    }
+    
+    {
+      std::lock_guard<std::mutex> lock(delta_mutex_);
+      delta_d_ += local_delta_d;
     }
     
     if (curlevel > maxlevel_) {
@@ -462,6 +446,9 @@ bool HakesFilterIndex::SearchWithFilter(int n, int d, const float* query,
     
     if (selectivity > 0.01f) {
       SearchGraphFilter(qvec, k, selectivity, id_selector, results);
+      if (results.size() < static_cast<size_t>(k) && id_selector != nullptr) {
+        SearchBruteForceFilter(qvec, k, id_selector, results);
+      }
     } else {
       SearchBruteForceFilter(qvec, k, id_selector, results);
     }
@@ -540,13 +527,210 @@ const float* HakesFilterIndex::GetDataByInternalId(tableint internal_id) const {
       &data_level0_memory_[internal_id * size_data_per_element_ + offset_data_]);
 }
 
-inline float L2Sqr(const float* a, const float* b, int d) {
-  float sum = 0.0f;
-  for (int i = 0; i < d; i++) {
-    float diff = a[i] - b[i];
-    sum += diff * diff;
+void HakesFilterIndex::GetNeighborsByHeuristic2(
+    std::priority_queue<std::pair<float, tableint>,
+                        std::vector<std::pair<float, tableint>>,
+                        FavorCompareByFirst<float>>& top_candidates,
+    size_t M) {
+  if (top_candidates.size() < M) {
+    return;
   }
-  return sum;
+
+  std::vector<std::pair<float, tableint>> candidates;
+  candidates.reserve(top_candidates.size());
+  while (!top_candidates.empty()) {
+    candidates.push_back(top_candidates.top());
+    top_candidates.pop();
+  }
+
+  std::reverse(candidates.begin(), candidates.end());
+  std::vector<std::pair<float, tableint>> return_list;
+  return_list.reserve(M);
+
+  for (const auto& current_pair : candidates) {
+    if (return_list.size() >= M)
+      break;
+
+    bool good = true;
+    float dist_to_query = current_pair.first;
+
+    for (const auto& second_pair : return_list) {
+      float curdist = L2Sqr(GetDataByInternalId(second_pair.second),
+                            GetDataByInternalId(current_pair.second), d_);
+      if (curdist < dist_to_query) {
+        good = false;
+        break;
+      }
+    }
+    if (good) {
+      return_list.push_back(current_pair);
+    }
+  }
+
+  for (const auto& current_pair : return_list) {
+    top_candidates.emplace(current_pair.first, current_pair.second);
+  }
+}
+
+tableint HakesFilterIndex::MutuallyConnectNewElement(
+    const float* data_point, tableint cur_c,
+    std::priority_queue<std::pair<float, tableint>,
+                        std::vector<std::pair<float, tableint>>,
+                        FavorCompareByFirst<float>>& top_candidates,
+    int level) {
+  size_t Mcurmax = level ? maxM_ : maxM0_;
+  GetNeighborsByHeuristic2(top_candidates, M_);
+  if (top_candidates.size() > M_)
+    throw std::runtime_error("Should not be more than M_ candidates returned by the heuristic");
+
+  std::vector<tableint> selectedNeighbors;
+  selectedNeighbors.reserve(M_);
+  while (!top_candidates.empty()) {
+    selectedNeighbors.push_back(top_candidates.top().second);
+    top_candidates.pop();
+  }
+  tableint next_closest_entry_point = selectedNeighbors.back();
+
+  {
+    linklistsizeint* ll_cur;
+    if (level == 0)
+      ll_cur = reinterpret_cast<linklistsizeint*>(
+          &data_level0_memory_[cur_c * size_data_per_element_]);
+    else
+      ll_cur = reinterpret_cast<linklistsizeint*>(
+          link_lists_[cur_c] + (level - 1) * size_links_per_element_);
+
+    if (*ll_cur) {
+      throw std::runtime_error("The newly inserted element should have blank link list");
+    }
+    *ll_cur = static_cast<linklistsizeint>(selectedNeighbors.size());
+    tableint* data = reinterpret_cast<tableint*>(ll_cur + 1);
+    for (size_t idx = 0; idx < selectedNeighbors.size(); idx++) {
+      if (data[idx])
+        throw std::runtime_error("Possible memory corruption");
+      if (level > element_levels_[selectedNeighbors[idx]])
+        throw std::runtime_error("Trying to make a link on a non-existent level");
+      data[idx] = selectedNeighbors[idx];
+    }
+  }
+
+  for (size_t idx = 0; idx < selectedNeighbors.size(); idx++) {
+    linklistsizeint* ll_other;
+    if (level == 0)
+      ll_other = reinterpret_cast<linklistsizeint*>(
+          &data_level0_memory_[selectedNeighbors[idx] * size_data_per_element_]);
+    else
+      ll_other = reinterpret_cast<linklistsizeint*>(
+          link_lists_[selectedNeighbors[idx]] + (level - 1) * size_links_per_element_);
+
+    size_t sz_link_list_other = *ll_other;
+
+    if (sz_link_list_other > Mcurmax)
+      throw std::runtime_error("Bad value of sz_link_list_other");
+    if (selectedNeighbors[idx] == cur_c)
+      throw std::runtime_error("Trying to connect an element to itself");
+    if (level > element_levels_[selectedNeighbors[idx]])
+      throw std::runtime_error("Trying to make a link on a non-existent level");
+
+    tableint* data = reinterpret_cast<tableint*>(ll_other + 1);
+
+    if (sz_link_list_other < Mcurmax) {
+      data[sz_link_list_other] = cur_c;
+      *ll_other = static_cast<linklistsizeint>(sz_link_list_other + 1);
+    } else {
+      float d_max = L2Sqr(data_point, GetDataByInternalId(selectedNeighbors[idx]), d_);
+      std::priority_queue<std::pair<float, tableint>,
+                          std::vector<std::pair<float, tableint>>,
+                          FavorCompareByFirst<float>> candidates;
+      candidates.emplace(d_max, cur_c);
+
+      for (size_t j = 0; j < sz_link_list_other; j++) {
+        candidates.emplace(
+            L2Sqr(GetDataByInternalId(data[j]), GetDataByInternalId(selectedNeighbors[idx]), d_),
+            data[j]);
+      }
+
+      GetNeighborsByHeuristic2(candidates, Mcurmax);
+
+      int indx = 0;
+      while (!candidates.empty()) {
+        data[indx] = candidates.top().second;
+        candidates.pop();
+        indx++;
+      }
+
+      *ll_other = static_cast<linklistsizeint>(indx);
+    }
+  }
+
+  return next_closest_entry_point;
+}
+
+void HakesFilterIndex::SearchBaseLayerFilter(
+    tableint ep_id, const float* data_point, int level,
+    std::priority_queue<std::pair<float, tableint>,
+                        std::vector<std::pair<float, tableint>>,
+                        FavorCompareByFirst<float>>& top_candidates) {
+  std::vector<bool> visited(cur_element_count_, false);
+
+  auto cmp_less = [](const std::pair<float, tableint>& a,
+                     const std::pair<float, tableint>& b) {
+    return a.first < b.first;
+  };
+  std::priority_queue<std::pair<float, tableint>,
+                      std::vector<std::pair<float, tableint>>,
+                      decltype(cmp_less)> candidate_set(cmp_less);
+
+  float lowerBound;
+  if (!IsMarkedDeleted(ep_id)) {
+    float dist = L2Sqr(data_point, GetDataByInternalId(ep_id), d_);
+    top_candidates.emplace(dist, ep_id);
+    lowerBound = dist;
+    candidate_set.emplace(-dist, ep_id);
+  } else {
+    lowerBound = std::numeric_limits<float>::max();
+    candidate_set.emplace(-lowerBound, ep_id);
+  }
+  visited[ep_id] = true;
+
+  while (!candidate_set.empty()) {
+    auto curr_el_pair = candidate_set.top();
+    if ((-curr_el_pair.first) > lowerBound && top_candidates.size() == ef_construction_) {
+      break;
+    }
+    candidate_set.pop();
+
+    tableint curNodeNum = curr_el_pair.second;
+
+    int* data;
+    if (level == 0)
+      data = reinterpret_cast<int*>(
+          &data_level0_memory_[curNodeNum * size_data_per_element_]);
+    else
+      data = reinterpret_cast<int*>(
+          link_lists_[curNodeNum] + (level - 1) * size_links_per_element_);
+
+    size_t size = *reinterpret_cast<linklistsizeint*>(data);
+    tableint* datal = reinterpret_cast<tableint*>(data + 1);
+
+    for (size_t j = 0; j < size; j++) {
+      tableint candidate_id = datal[j];
+      if (visited[candidate_id])
+        continue;
+      visited[candidate_id] = true;
+
+      float dist1 = L2Sqr(data_point, GetDataByInternalId(candidate_id), d_);
+      if (top_candidates.size() < ef_construction_ || lowerBound > dist1) {
+        candidate_set.emplace(-dist1, candidate_id);
+        if (!IsMarkedDeleted(candidate_id))
+          top_candidates.emplace(dist1, candidate_id);
+        if (top_candidates.size() > ef_construction_)
+          top_candidates.pop();
+        if (!top_candidates.empty())
+          lowerBound = top_candidates.top().first;
+      }
+    }
+  }
 }
 
 void HakesFilterIndex::SearchBaseLayerSTFilter(
